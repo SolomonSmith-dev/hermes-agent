@@ -686,14 +686,49 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+def _branches_checked_out(repo_root: Path) -> dict[str, str]:
+    """Map branch name -> worktree path for every branch checked out in any worktree of the repo."""
+    result = _git(repo_root, "worktree", "list", "--porcelain", timeout=30)
+    if result.returncode != 0:
+        return {}
+    found: dict[str, str] = {}
+    path = ""
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line.startswith("branch refs/heads/"):
+            found[line[len("branch refs/heads/"):]] = path
+    return found
+
+
+def _ensure_git_worktree(
+    repo_root: Path, target: Path, branch_name: str, task_id: Optional[str] = None
+) -> str:
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    Returns the branch actually checked out. Git refuses to check a branch out in two worktrees, so when
+    ``branch_name`` is already checked out elsewhere (often the main checkout) the worktree gets a fresh
+    ``wt/<task-id>`` branch cut from that branch's tip instead of failing the dispatch.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
-        return
+        return branch_name
     target.parent.mkdir(parents=True, exist_ok=True)
-    if _git_branch_exists(repo_root, branch_name):
+    used = branch_name
+    checked_out = _branches_checked_out(repo_root)
+    if branch_name in checked_out:
+        used = f"wt/{task_id or target.name}"
+        if used in checked_out:
+            raise RuntimeError(
+                f"git worktree add failed for {target}: branch {branch_name} is checked out at "
+                f"{checked_out[branch_name]} and fallback branch {used} is checked out at {checked_out[used]}"
+            )
+        if _git_branch_exists(repo_root, used):
+            args = ["worktree", "add", str(target), used]
+        else:
+            args = ["worktree", "add", "-b", used, str(target), branch_name]
+    elif _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
     else:
         args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
@@ -701,15 +736,15 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
-            f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+            f"git worktree add failed for {target} on branch {used}: {stderr}"
         )
+    return used
 
 
 def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
     """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
     target = repo_root / ".worktrees" / task_id
-    _ensure_git_worktree(repo_root, target, branch_name)
-    return target, branch_name
+    return target, _ensure_git_worktree(repo_root, target, branch_name, task_id)
 
 
 def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
@@ -764,8 +799,8 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
-                return fallback.resolve(strict=False), branch_name
+                used = _ensure_git_worktree(fallback_root, fallback, branch_name, task.id)
+                return fallback.resolve(strict=False), used
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
         return requested_resolved, actual_branch or branch_name
@@ -780,8 +815,8 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
-    return requested, branch_name
+    used = _ensure_git_worktree(repo_root, requested, branch_name, task.id)
+    return requested, used
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:

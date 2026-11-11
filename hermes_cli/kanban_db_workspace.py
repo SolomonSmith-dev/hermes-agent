@@ -641,6 +641,40 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     return result.returncode == 0
 
 
+def _git_rev(repo_root: Path, ref: str) -> Optional[str]:
+    result = _git(repo_root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", timeout=30)
+    return (result.stdout or "").strip() or None if result.returncode == 0 else None
+
+
+def _fresh_or_valid_fallback(
+    repo_root: Path, occupied: str, fallback: str, checked_out: dict[str, str]
+) -> str:
+    """Pick the branch a worktree should use when ``occupied`` is taken and ``fallback`` already exists.
+
+    A leftover ``wt/<task-id>`` branch is reused only when it is current: it points at the occupied
+    branch's tip, or sits ahead of it (a crashed run's work). A branch that is behind or has diverged
+    would start the worker from stale code, so a new ``<fallback>-<tip>`` name is used instead and the
+    old branch is left untouched (X1 KB3).
+    """
+    tip = _git_rev(repo_root, occupied)
+    if tip is None:
+        return fallback
+    candidate = fallback
+    for attempt in range(1, 10):
+        if candidate not in checked_out:
+            cand_tip = _git_rev(repo_root, candidate)
+            if cand_tip is None:
+                return candidate  # free name: caller creates it from the occupied tip
+            if cand_tip == tip or _git(
+                repo_root, "merge-base", "--is-ancestor", tip, candidate, timeout=30
+            ).returncode == 0:
+                return candidate
+        candidate = f"{fallback}-{tip[:7]}" if attempt == 1 else f"{fallback}-{tip[:7]}-{attempt}"
+    raise RuntimeError(
+        f"git worktree add failed: no usable fallback branch for {occupied} (tried {fallback} and variants)"
+    )
+
+
 def _git_abs_path(path: Path, flag: str) -> Optional[Path]:
     out = _kb._git_out(path, "rev-parse", "--path-format=absolute", flag)
     return Path(out).expanduser().resolve(strict=False) if out else None
@@ -713,7 +747,8 @@ def _ensure_git_worktree(
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
-        return branch_name
+        # Report the branch the worktree really has, not the one that was requested (X1 KB1).
+        return _git_current_branch(target) or branch_name
     target.parent.mkdir(parents=True, exist_ok=True)
     used = branch_name
     checked_out = _branches_checked_out(repo_root)
@@ -725,7 +760,11 @@ def _ensure_git_worktree(
                 f"{checked_out[branch_name]} and fallback branch {used} is checked out at {checked_out[used]}"
             )
         if _git_branch_exists(repo_root, used):
-            args = ["worktree", "add", str(target), used]
+            used = _fresh_or_valid_fallback(repo_root, branch_name, used, checked_out)
+            if _git_branch_exists(repo_root, used):
+                args = ["worktree", "add", str(target), used]
+            else:
+                args = ["worktree", "add", "-b", used, str(target), branch_name]
         else:
             args = ["worktree", "add", "-b", used, str(target), branch_name]
     elif _git_branch_exists(repo_root, branch_name):

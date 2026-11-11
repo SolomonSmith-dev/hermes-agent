@@ -96,3 +96,51 @@ def test_ensure_git_worktree_returns_the_branch_used(kanban_home, tmp_path):
     used = kbw._ensure_git_worktree(repo, repo / ".worktrees" / "t_abc", "feat/x")
     assert used == "wt/t_abc"
     assert kbw._ensure_git_worktree(repo, repo / ".worktrees" / "t_new", "brand/new") == "brand/new"
+
+
+# --- Codex round (X1) KB1 / KB3 -------------------------------------------------------------
+
+
+def test_kb1_reused_worktree_returns_the_branch_actually_checked_out(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path, "feat/x")
+    target = repo / ".worktrees" / "t_abc"
+    assert kbw._ensure_git_worktree(repo, target, "feat/x", "t_abc") == "wt/t_abc"
+
+    # A dispatch retry finds the worktree already there: it must report wt/t_abc, not feat/x.
+    assert kbw._ensure_git_worktree(repo, target, "feat/x", "t_abc") == "wt/t_abc"
+
+
+def _commit(repo: Path, name: str) -> str:
+    (repo / name).write_text(name, encoding="utf-8")
+    _git(repo, "add", name)
+    _git(repo, "commit", "-m", name)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def test_kb3_stale_fallback_branch_is_not_attached(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path, "feat/x")
+    stale_tip = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "branch", "wt/t_abc")  # left behind by an earlier, removed worktree
+    new_tip = _commit(repo, "advance.txt")  # feat/x moved on
+
+    target = repo / ".worktrees" / "t_abc"
+    used = kbw._ensure_git_worktree(repo, target, "feat/x", "t_abc")
+
+    assert used != "wt/t_abc"
+    assert used.startswith("wt/t_abc")
+    assert _git(target, "rev-parse", "HEAD") == new_tip  # worker starts from the current tip
+    assert _git(repo, "rev-parse", "wt/t_abc") == stale_tip  # the old branch is left alone
+
+
+def test_kb3_fallback_branch_with_prior_work_is_reused(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path, "feat/x")
+    _git(repo, "branch", "wt/t_abc")
+    _git(repo, "checkout", "-q", "wt/t_abc")
+    work_tip = _commit(repo, "worker.txt")  # fallback is ahead of feat/x: it holds real work
+    _git(repo, "checkout", "-q", "feat/x")
+
+    target = repo / ".worktrees" / "t_abc"
+    used = kbw._ensure_git_worktree(repo, target, "feat/x", "t_abc")
+
+    assert used == "wt/t_abc"
+    assert _git(target, "rev-parse", "HEAD") == work_tip

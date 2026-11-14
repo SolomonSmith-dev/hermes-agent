@@ -17,7 +17,12 @@ from typing import Any, Dict, List
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
-from agent.usage_pricing import estimate_usage_cost, normalize_usage, with_served_service_tier
+from agent.usage_pricing import (
+    estimate_usage_cost,
+    normalize_usage,
+    resolve_billing_route,
+    with_served_service_tier,
+)
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -36,6 +41,21 @@ class ResponseUsageOutcome:
 
     compression_attempts: int
     rearmed: bool = False
+
+
+def _billing_mode(agent: Any, cost_result: Any) -> str | None:
+    """Billing mode for the usage row: subscription_included, else the route's mode."""
+    if getattr(cost_result, "status", None) == "included":
+        return "subscription_included"
+    try:
+        route = resolve_billing_route(
+            getattr(agent, "model", "") or "",
+            getattr(agent, "provider", None),
+            getattr(agent, "base_url", None),
+        )
+        return route.billing_mode or None
+    except Exception:
+        return None
 
 
 def _loop_mod():
@@ -274,8 +294,7 @@ def record_response_usage(
                 cost_source=cost_result.source,
                 billing_provider=agent.provider,
                 billing_base_url=agent.base_url,
-                billing_mode="subscription_included"
-                if cost_result.status == "included" else None,
+                billing_mode=_billing_mode(agent, cost_result),
                 model=agent.model,
                 api_call_count=1,
                 task=getattr(agent, "_turn_route_task", "") or "",
